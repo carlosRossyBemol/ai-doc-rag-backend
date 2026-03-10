@@ -1,25 +1,52 @@
-from fastapi import APIRouter
-from pydantic import BaseModel
-from app.services.rag import ask_question
+from fastapi import APIRouter, HTTPException
+from app.services.rag import RAGService
+from app.services.token_logger import TokenLogger
+from app.models.schemas import ChatRequest, ChatResponse
+from fastapi.responses import StreamingResponse
 
 router = APIRouter()
-
-
-class ChatRequest(BaseModel):
-    question: str
-
-
-class ChatResponse(BaseModel):
-    question: str
-    answer: str
-
+rag_service = RAGService()
+token_logger = TokenLogger()
 
 @router.post("/", response_model=ChatResponse)
-def chat(body: ChatRequest):
+async def chat(request: ChatRequest):
+    import traceback
+    try:
+        result = await rag_service.answer(
+            question=request.question,
+            history=request.history,
+            doc_filter=request.doc_filter
+        )
+        token_logger.log(result["token_usage"])
+        return result
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
 
-    answer = ask_question(body.question)
+@router.get("/history/{session_id}")
+async def get_history(session_id: str):
+    """Retrieve conversation history for a session."""
+    history = await rag_service.get_history(session_id)
+    return {"session_id": session_id, "history": history}
 
-    return {
-        "question": body.question,
-        "answer": answer
-    }
+@router.delete("/history/{session_id}")
+async def clear_history(session_id: str):
+    """Clear conversation history for a session."""
+    await rag_service.clear_history(session_id)
+    return {"message": "History cleared"}
+
+@router.post("/stream")
+async def chat_stream(request: ChatRequest):
+    """Endpoint SSE — retorna tokens em tempo real."""
+    return StreamingResponse(
+        rag_service.answer_stream(
+            question=request.question,
+            history=request.history,
+            doc_filter=request.doc_filter
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no", 
+        }
+    )

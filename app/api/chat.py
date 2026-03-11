@@ -25,19 +25,16 @@ async def chat(request: ChatRequest):
 
 @router.get("/history/{session_id}")
 async def get_history(session_id: str):
-    """Retrieve conversation history for a session."""
     history = await rag_service.get_history(session_id)
     return {"session_id": session_id, "history": history}
 
 @router.delete("/history/{session_id}")
 async def clear_history(session_id: str):
-    """Clear conversation history for a session."""
     await rag_service.clear_history(session_id)
     return {"message": "History cleared"}
 
 @router.post("/stream")
 async def chat_stream(request: ChatRequest):
-    """Endpoint SSE — retorna tokens em tempo real."""
     return StreamingResponse(
         rag_service.answer_stream(
             question=request.question,

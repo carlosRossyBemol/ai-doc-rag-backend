@@ -1,32 +1,54 @@
-from pypdf import PdfReader
+import uuid
+import io
+from typing import Optional
+import pypdf
 from app.core.chunker import chunk_text
-from app.core.embeddings import embed_text
-from app.core.vector_store import add_documents
+from app.core.embeddings import embed_texts
+from app.core.vector_store import upsert_chunks, delete_by_doc_id, get_collection
 
-def ingest_pdf(file_path):
+class IngestionService:
+    async def ingest(self, filename: str, content: bytes, content_type: str) -> dict:
+        doc_id = str(uuid.uuid4())
 
-    reader = PdfReader(file_path)
+        if content_type == "application/pdf":
+            text = self._extract_pdf(content)
+        else:
+            text = content.decode("utf-8")
 
-    text = ""
+        chunks = chunk_text(text, filename=filename, doc_id=doc_id)
+        if not chunks:
+            return {"doc_id": doc_id, "filename": filename, "chunks_created": 0, "status": "empty"}
 
-    for page in reader.pages:
-        page_text = page.extract_text()
+        texts = [c.text for c in chunks]
+        embeddings = embed_texts(texts)
 
-        if page_text:
-            text += page_text
+        ids = [f"{doc_id}_{i}" for i in range(len(chunks))]
+        upsert_chunks(chunks, embeddings, ids)
 
-    print("TEXT LENGTH:", len(text))
+        return {
+            "doc_id": doc_id,
+            "filename": filename,
+            "chunks_created": len(chunks),
+            "status": "indexed"
+        }
 
-    chunks = chunk_text(text)
+    def _extract_pdf(self, content: bytes) -> str:
+        reader = pypdf.PdfReader(io.BytesIO(content))
+        pages = [page.extract_text() or "" for page in reader.pages]
+        return "\n\n".join(pages)
 
-    print("CHUNKS:", len(chunks))
+    async def list_documents(self) -> list:
+        collection = get_collection()
+        results = collection.get(include=["metadatas"])
+        seen = {}
+        for meta in results["metadatas"]:
+            doc_id = meta["doc_id"]
+            if doc_id not in seen:
+                seen[doc_id] = {
+                    "doc_id": doc_id,
+                    "filename": meta["filename"]
+                }
+        return list(seen.values())
 
-    embeddings = embed_text(chunks)
-
-    print("EMBEDDINGS:", len(embeddings))
-
-    metadata = [{"source": file_path}] * len(chunks)
-
-    add_documents(chunks, embeddings, metadata)
-
-    print("DOCUMENT INDEXED:", file_path)
+    async def delete_document(self, doc_id: str):
+        delete_by_doc_id(doc_id)

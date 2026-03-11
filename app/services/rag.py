@@ -1,14 +1,153 @@
-from app.core.embeddings import embed_text
-from app.core.vector_store import search
+import json
+import os
+from typing import Optional
+from app.core.embeddings import embed_query
+from app.core.vector_store import query_similar
+from app.core.config import settings
 
-def ask_question(question):
+_sessions: dict[str, list] = {}
 
-    query_embedding = embed_text([question])[0]
+class RAGService:
 
-    results = search(query_embedding)
+    async def answer_stream(self, question: str, history: list, doc_filter=None):
+        query_embedding = embed_query(question)
+        where = {"doc_id": doc_filter} if doc_filter else None
 
-    docs = results["documents"][0]
+        try:
+            results = query_similar(query_embedding, n_results=settings.TOP_K_RESULTS, where=where)
+            context_chunks = results["documents"][0] if results["documents"] else []
+            sources = results["metadatas"][0] if results["metadatas"] else []
+        except Exception:
+            context_chunks, sources = [], []
 
-    context = "\n".join(docs)
+        if not context_chunks:
+            yield f"data: {json.dumps({'type': 'error', 'content': 'Nenhum documento indexado.'})}\n\n"
+            return
 
-    return context
+        windowed_history = history[-(settings.MEMORY_WINDOW * 2):]
+        context = "\n\n---\n\n".join(context_chunks)
+        prompt = self._build_prompt(question, context, windowed_history)
+
+        api_key = settings.AZURE_OPENAI_API_KEY
+        if not api_key:
+            yield f"data: {json.dumps({'type': 'error', 'content': 'AZURE_OPENAI_API_KEY não configurada.'})}\n\n"
+            return
+
+        from openai import AsyncAzureOpenAI
+
+        client = AsyncAzureOpenAI(
+            api_key=settings.AZURE_OPENAI_API_KEY,
+            azure_endpoint=settings.AZURE_OPENAI_ENDPOINT,
+            api_version=settings.AZURE_OPENAI_API_VERSION,
+        )
+
+        yield f"data: {json.dumps({'type': 'sources', 'content': sources})}\n\n"
+
+        completion_tokens = 0
+        stream = await client.chat.completions.create(
+            model=settings.AZURE_OPENAI_DEPLOYMENT,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            stream=True
+        )
+
+        async for chunk in stream:
+            delta = chunk.choices[0].delta.content if chunk.choices else None
+            if delta:
+                completion_tokens += 1
+                yield f"data: {json.dumps({'type': 'token', 'content': delta})}\n\n"
+
+        yield f"data: {json.dumps({'type': 'done', 'token_usage': {'prompt_tokens': 0, 'completion_tokens': completion_tokens, 'total_tokens': completion_tokens}})}\n\n"
+
+    def _build_prompt(self, question: str, context: str, history: list) -> str:
+        history_str = "\n".join(
+            f"{'User' if m.role == 'user' else 'Assistant'}: {m.content}"
+            for m in history
+        )
+        return f"""You are a helpful assistant that answers questions based strictly on the provided documentation context.
+
+## CONTEXT (retrieved documentation chunks):
+{context}
+
+## CONVERSATION HISTORY:
+{history_str if history_str else "(no previous turns)"}
+
+## USER QUESTION:
+{question}
+
+## INSTRUCTIONS:
+- Answer based only on the context above
+- If the answer is not in the context, say "I couldn't find this in the provided documentation"
+- Be concise; cite the source filename when relevant
+- Do not hallucinate or add information not present in the context
+
+ANSWER:"""
+
+    async def _generate(self, prompt: str) -> tuple[str, dict]:
+        api_key = settings.AZURE_OPENAI_API_KEY
+        endpoint = settings.AZURE_OPENAI_ENDPOINT
+        deployment = settings.AZURE_OPENAI_DEPLOYMENT
+        if api_key and endpoint and deployment:
+            return await self._azure_generate(prompt)
+        return (
+            "No LLM configured. Set AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT, and AZURE_OPENAI_DEPLOYMENT in .env.",
+            {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        )
+
+    async def _azure_generate(self, prompt: str) -> tuple[str, dict]:
+        from openai import AsyncAzureOpenAI
+        client = AsyncAzureOpenAI(
+            api_key=settings.AZURE_OPENAI_API_KEY,
+            azure_endpoint=settings.AZURE_OPENAI_ENDPOINT,
+            api_version=settings.AZURE_OPENAI_API_VERSION,
+        )
+
+        response = await client.chat.completions.create(
+            model=settings.AZURE_OPENAI_DEPLOYMENT,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+        )
+        usage = response.usage
+        return response.choices[0].message.content, {
+            "prompt_tokens": usage.prompt_tokens,
+            "completion_tokens": usage.completion_tokens,
+            "total_tokens": usage.total_tokens
+        }
+
+    async def answer(self, question: str, history: list, doc_filter=None):
+        query_embedding = embed_query(question)
+        where = {"doc_id": doc_filter} if doc_filter else None
+
+        try:
+            results = query_similar(query_embedding, n_results=settings.TOP_K_RESULTS, where=where)
+            context_chunks = results["documents"][0] if results["documents"] else []
+            sources = results["metadatas"][0] if results["metadatas"] else []
+        except Exception:
+            context_chunks, sources = [], []
+
+        if not context_chunks:
+            return {
+                "answer": "Nenhum documento indexado.",
+                "sources": [],
+                "token_usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                "context_used": 0
+            }
+
+        windowed_history = history[-(settings.MEMORY_WINDOW * 2):]
+        context = "\n\n---\n\n".join(context_chunks)
+        prompt = self._build_prompt(question, context, windowed_history)
+
+        answer_text, token_usage = await self._generate(prompt)
+
+        return {
+            "answer": answer_text,
+            "sources": sources,
+            "token_usage": token_usage,
+            "context_used": len(context_chunks)
+        }
+
+    async def get_history(self, session_id: str) -> list:
+        return _sessions.get(session_id, [])
+
+    async def clear_history(self, session_id: str):
+        _sessions.pop(session_id, None)

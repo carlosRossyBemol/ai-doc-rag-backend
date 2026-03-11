@@ -18,8 +18,11 @@ class Settings(BaseSettings):
     TOP_K_RESULTS: int = 5     
     MEMORY_WINDOW: int = 6      
 
-    OPENAI_API_KEY: Optional[str] = None
-    LLM_MODEL: str = "gpt-4o-mini"
+    LLM_MODEL: str = "gpt-4.1-mini"
+    AZURE_OPENAI_API_KEY: Optional[str] = None
+    AZURE_OPENAI_ENDPOINT: Optional[str] = None
+    AZURE_OPENAI_DEPLOYMENT: Optional[str] = None
+    AZURE_OPENAI_API_VERSION: str = "2025-01-01-preview"
 
     TOKEN_LOG_FILE: str = "./logs/token_usage.jsonl"
 
